@@ -1,0 +1,299 @@
+#!/usr/bin/perl -w
+#
+# NAME
+#   dhcpstatd
+#
+# DESCRIPTION
+#   This script returns the number of DHCP leases currently in use or abandoned on this system.
+#
+# AUTHOR
+#   Rob Colantuoni
+#   SUNYAB CIT/OSS
+#
+# CREATED
+#   Oct 7, 2004
+
+use strict;
+use Sys::Hostname;
+require 'uptime.pm';
+
+use Net::DHCP::Server;
+
+# CONFIG VARS
+my $verbose	= 0;
+my $maxlines	= 10;
+
+# VARS
+my $lines_received = 0;
+my $opt_subnet	   	= 'all';
+my $opt_shared_subnet	= 'all';
+my $opt_leasetype  	= 'used';
+
+while ( my $line = <> ) {
+
+	$line =~ s///g;
+
+	last if($line =~ /^$/);
+
+	if($line =~ /^\s*(SHAREDSUBNET:|SUBNET:|LEASETYPE:)\s*(.+)\s*$/) {
+		
+		my $label = $1;
+		my $value = $2;
+		
+		if($label eq 'SUBNET:') {
+
+    			if ($value =~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/) {
+				$opt_subnet = $value;
+    			} else {
+       				exit (-1);
+			}
+		
+		} elsif($label eq 'LEASETYPE:') {
+
+    			if ($value =~ /^used$|^abandoned$/) {
+				$opt_leasetype = $value;
+			} else {
+       				exit (-1);
+			}
+
+		} elsif($label eq 'SHAREDSUBNET:') {
+			$opt_shared_subnet = $value;
+
+		} else {
+      			exit (-1);
+		}
+		
+	} else {
+		# line doesn't match our input format
+       		exit(-1);
+	}
+
+	$lines_received++;
+	last if($lines_received >= $maxlines);
+}
+
+print "start\n";
+
+my ($CONFIG_FILE, $LEASE_FILE) = ('./dhcpd.conf','./dhcpd.leases');
+
+my $server = new Net::DHCP::Server(
+                                        -configFile => './dhcpd.conf',
+                                        -leasesFile => './dhcpd.leases'
+);
+
+print "finish\n";
+
+exit;
+
+my $lease_obj;
+my $subnet;
+my $generic_lease_count  = {};
+my $pool_count 		 = {};
+my ($n_leases, $n_pools) = (0,0);
+my %seen		 = ();
+
+my $pools  = Pool::GetPools   ($CONFIG_FILE);
+
+my $leases = ();
+
+if ($opt_leasetype =~ /^used$/) {
+
+	$leases = $server->leases->filter(
+						-binding_state => 'active',
+						-current       => 1
+					    ); 
+
+} elsif ($opt_leasetype =~ /^abandoned$/) {
+
+	$leases = $server->leases->filter(
+						-binding_state => 'abandoned',
+						-current       => 1
+				    	); 
+} else {
+
+	# $leases = $server->leases->all() isn't appropriate here
+
+	# we want only current leases... not old leases still in the file
+	$leases = $server->leases->filter(
+						-current       => 1
+				    	); 
+}
+
+#foreach
+#  	$generic_lease_count->{$lease_obj->subnet ()} += 1 unless $seen{$lease_obj->ip ()}++;
+
+
+my $pool_obj;
+my $shared_pool;
+
+foreach $pool_obj (@{$pools}) {
+  	$shared_pool->{$pool_obj->shared_subnet ()}->{$pool_obj->subnet ()} = $pool_obj;
+  	$pool_count->{$pool_obj->subnet ()} = $pool_obj->size ();
+}
+
+if ($verbose) {
+   	foreach $subnet (sort keys %{$generic_lease_count}) {
+     		print "number of $opt_leasetype leases on the $subnet net => $generic_lease_count->{$subnet}\n";
+  	}
+}
+
+if ($opt_subnet =~ /^all$/) { # scope: count all leases of type -t in dhcpd.leases
+
+   	foreach $subnet (sort keys %{$generic_lease_count}) {
+     		$n_leases += $generic_lease_count->{$subnet};
+   	}
+
+   	foreach $subnet (sort keys %{$pool_count}) {
+     		$n_pools += $pool_count->{$subnet};
+   	}
+
+} else {
+
+     	if (defined ($generic_lease_count->{$opt_subnet})) { # target subnet's lease_type count
+        	$n_leases += $generic_lease_count->{$opt_subnet};
+     	}
+
+     	if (defined ($pool_count->{$opt_subnet})) { # target subnet's lease pool size
+        	$n_pools += $pool_count->{$opt_subnet};
+     	}
+}
+
+if ($opt_shared_subnet !~ /^all$/) {
+
+   	$n_leases = 0;
+   	$n_pools  = 0;
+
+   	if(defined($shared_pool->{$opt_shared_subnet})) {
+   		foreach my $s_pools (keys %{$shared_pool->{$opt_shared_subnet}}) {
+			my $s_pool = $shared_pool->{$opt_shared_subnet}->{$s_pools};	
+    
+        		$n_leases += $generic_lease_count->{$s_pool->subnet} if(defined($generic_lease_count->{$s_pool->subnet}));
+        		$n_pools += $pool_count->{$s_pool->subnet};
+   		}
+   	}
+}
+
+
+print "$n_leases\n"; 
+print "$n_pools\n";
+print "" . txtut (uptime (`who -b`)) . "\n";
+print Sys::Hostname::hostname () . "\n";
+exit (0);
+
+
+sub Usage {
+# input format
+# SHAREDSUBNET:	all  | shared subnet name	(optional) (default: all)
+# SUBNET: 	all  | subnet  			(optional) (default: all)
+# LEASETYPE: 	used | abandoned		(required)
+}
+
+
+__END__
+
+=head1 dhcpstatd
+
+This script is meant to be run via xinetd. When run, it expects optional parameters and will return
+various DHCP statistics based on those parameters. You should connect to dhcpstatd using it's client
+(dhcpstat.pl), although you can run and test it on the commandline.
+
+=head1 Setting up dhcpstatd with xinetd
+
+First, edit the /etc/services file and add the following line:
+
+	dhcpstat        10008/tcp                       # dhcpstat server
+
+Then, create the following file: /etc/xinetd.d/dhcpstat
+
+The contents of that file should be:
+
+ 	service dhcpstat
+ 	{
+        	disable         = no
+        	socket_type     = stream
+        	port            = 10008
+        	protocol        = tcp
+        	wait            = no
+       		user            = root
+        	server          = /opt/dhcp/bin/dhcpstatd
+ 	}
+
+Feel free to change the 'server' field to match your setup. Once your changes
+are complete, restart xinetd by running:
+
+	/etc/init.d/xinetd stop
+	/etc/init.d/xinetd start
+
+You may also have to update your iptables setup to allow remote machines to
+access the dhcpstat port.
+
+You may test the setup by telneting to the dhcpstat port and hitting enter.
+It should return some statistical information similar to below:
+
+	$ telnet localhost dhcpstat
+	Trying 127.0.0.1...
+	Connected to localhost.
+	Escape character is '^]'.
+
+	706
+	1144
+	0 days 20:02:00
+	dhcp-server-name
+	Connection closed by foreign host.
+	$                  
+
+Good luck and have fun!
+
+=head1 CATEGORIES
+
+=over 4
+
+=item B<DHCP>
+
+=item B<STATS>
+
+=back
+
+=head1 AUTHOR INFORMATION
+
+Robert G Colantuoni <rgc@buffalo.edu>
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself.
+
+=head1 CHANGE LOG
+
+=over 4
+
+=item B<8-Oct-2004>
+Added perldoc
+
+=back
+
+=head1 BUGS
+
+Address bug reports and comments to: OSS Software <oss-unix@buffalo.edu>.
+When sending bug reports, please provide the version of script, the
+version of Perl, the name and version of the operating system you
+are using, and any other relevant information you may have.
+
+=head1 DEPENDENCIES
+
+L<Sys::Hostname>
+
+L<Lease.pm>
+
+L<Pool.pm>
+
+L<uptime.pm>
+
+=head1 SEE ALSO
+
+L<dhcpstat.pl>
+
+L<xinetd>
+
+=cut
+
+
+
